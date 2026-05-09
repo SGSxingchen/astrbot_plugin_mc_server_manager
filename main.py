@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import builtins
+import json
 import re
 import shlex
 import struct
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
+from astrbot.core.platform.astr_message_event import MessageSession
+from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 PLUGIN_NAME = "astrbot_plugin_mc_server_manager"
 PLUGIN_VERSION = "1.0.0"
@@ -53,11 +61,78 @@ DEFAULTS: dict[str, Any] = {
         "save-off",
         "rm",
     ],
+    "chat_require_discord_binding": True,
+    "enable_chat_bridge": False,
+    "chat_prefix": "!ai",
+    "chat_prefixes": [],
+    "chat_poll_interval": 2,
+    "chat_allowed_players": [],
+    "chat_blocked_players": [],
+    "chat_message_max_chars": 500,
+    "chat_player_cooldown_seconds": 10,
+    "chat_global_cooldown_seconds": 1,
+    "chat_dedupe_ttl_seconds": 600,
+    "chat_poll_limit": 20,
+    "chat_reply_max_chars": 900,
+    "chat_reply_chunk_chars": 220,
+    "chat_discord_sync": True,
+    "enable_llm_tool": False,
+    "llm_tool_allowed_in_mc_chat": False,
+    "allowed_rcon_for_tool": ["list"],
+    "rcon_tool_timeout_seconds": 8,
+    "rcon_tool_output_max_chars": 2000,
 }
 
 
 class RconError(RuntimeError):
     """Raised when an RCON request fails."""
+
+
+class MinecraftSyntheticEvent(AstrMessageEvent):
+    """Discord-backed synthetic event produced by Minecraft in-game chat.
+
+    Its `send()` deliberately does not use the Discord adapter's normal send path.
+    Final LLM output is mirrored by the plugin to Minecraft via RCON and to the
+    bound Discord channel directly, avoiding a second event-queue loop.
+    """
+
+    def __init__(
+        self,
+        *,
+        plugin: "AstrbotPluginMcServerManager",
+        player: str,
+        question: str,
+        event_id: str,
+        message_str: str,
+        message_obj: AstrBotMessage,
+        platform_meta: Any,
+        session_id: str,
+        client: Any,
+    ) -> None:
+        super().__init__(
+            message_str=message_str,
+            message_obj=message_obj,
+            platform_meta=platform_meta,
+            session_id=session_id,
+        )
+        self.client = client
+        self.interaction_followup_webhook = None
+        self._mcsm_plugin = plugin
+        self._mcsm_player = player
+        self._mcsm_question = question
+        self._mcsm_event_id = event_id
+
+    async def send(self, message: MessageChain) -> None:
+        text = self._mcsm_plugin._message_chain_to_text(message)
+        if not text.strip():
+            return
+        await self._mcsm_plugin._send_chat_bridge_reply(
+            player=self._mcsm_player,
+            question=self._mcsm_question,
+            answer=text,
+            event_id=self._mcsm_event_id,
+        )
+        await AstrMessageEvent.send(self, message)
 
 
 def _clip(text: Any, limit: int, suffix: str = "…") -> str:
@@ -132,6 +207,11 @@ class AstrbotPluginMcServerManager(Star):
         super().__init__(context)
         self.config = config or {}
         self._op_lock = asyncio.Lock()
+        self._chat_bridge_task: asyncio.Task | None = None
+        self._chat_generation = uuid.uuid4().hex
+        self._chat_seen: dict[str, float] = {}
+        self._chat_player_last: dict[str, float] = {}
+        self._chat_global_last = 0.0
 
     # ──────────────────────────────── Config ────────────────────────────────
 
@@ -194,6 +274,36 @@ class AstrbotPluginMcServerManager(Star):
         configured = _normalize_list(self._cfg("deny_commands"))
         return [item.lower().lstrip("/").strip() for item in configured if item.strip()]
 
+    @property
+    def rcon_enabled(self) -> bool:
+        return _as_bool(self._cfg("rcon_enabled"), False)
+
+    @property
+    def enable_chat_bridge(self) -> bool:
+        return _as_bool(self._cfg("enable_chat_bridge"), False)
+
+    @property
+    def chat_require_discord_binding(self) -> bool:
+        return _as_bool(self._cfg("chat_require_discord_binding"), True)
+
+    @property
+    def chat_prefixes(self) -> list[str]:
+        prefixes = _normalize_list(self._cfg("chat_prefixes"))
+        primary = str(self._cfg("chat_prefix") or "").strip()
+        if primary:
+            prefixes.insert(0, primary)
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in prefixes:
+            if item and item not in seen:
+                result.append(item)
+                seen.add(item)
+        return result or ["!ai"]
+
+    @property
+    def allowed_rcon_for_tool(self) -> list[str]:
+        return [item.lower().lstrip("/").strip() for item in _normalize_list(self._cfg("allowed_rcon_for_tool"))]
+
     # ─────────────────────────────── Permissions ─────────────────────────────
 
     def _is_astrbot_admin(self, event: AstrMessageEvent) -> bool:
@@ -229,6 +339,53 @@ class AstrbotPluginMcServerManager(Star):
 
     def _can_view_id(self, event: AstrMessageEvent, user_id: str | int) -> bool:
         return self.public_status or self._can_manage_id(event, user_id)
+
+    # ─────────────────────────────── Persistence ─────────────────────────────
+
+    def _plugin_data_dir(self) -> Path:
+        path = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _chat_binding_path(self) -> Path:
+        return self._plugin_data_dir() / "chat_binding.json"
+
+    def _load_chat_binding(self) -> dict[str, Any] | None:
+        try:
+            path = self._chat_binding_path()
+            if not path.exists():
+                return None
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("unified_msg_origin"):
+                return data
+        except Exception as exc:
+            logger.warning("读取 MC 聊天桥 Discord 绑定失败：%s", exc)
+        return None
+
+    def _save_chat_binding(self, event: AstrMessageEvent) -> dict[str, Any]:
+        try:
+            sender_name = str(event.get_sender_name() or "")
+        except Exception:
+            sender_name = ""
+        data = {
+            "unified_msg_origin": event.unified_msg_origin,
+            "platform": event.get_platform_name(),
+            "session_id": getattr(event, "session_id", "") or getattr(getattr(event, "message_obj", None), "session_id", ""),
+            "bound_by": str(event.get_sender_id()),
+            "bound_by_name": sender_name,
+            "bound_at": int(time.time()),
+        }
+        path = self._chat_binding_path()
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        return data
+
+    def _delete_chat_binding(self) -> None:
+        try:
+            self._chat_binding_path().unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("删除 MC 聊天桥 Discord 绑定失败：%s", exc)
 
     # ─────────────────────────────── Rendering ───────────────────────────────
 
@@ -726,10 +883,11 @@ class AstrbotPluginMcServerManager(Star):
 
     # ─────────────────────────────── RCON ────────────────────────────────────
 
-    async def _rcon_exchange(self, command: str) -> str:
+    async def _rcon_exchange(self, command: str, timeout: float | None = None) -> str:
         host = str(self._cfg("rcon_host") or "127.0.0.1").strip()
         port = _as_int(self._cfg("rcon_port"), int(DEFAULTS["rcon_port"]), 1, 65535)
         password = str(self._cfg("rcon_password") or "")
+        timeout = float(timeout or self._cfg("rcon_tool_timeout_seconds") or 8)
         if not password:
             raise RconError("RCON 已启用但未配置 rcon_password。")
 
@@ -746,17 +904,17 @@ class AstrbotPluginMcServerManager(Star):
 
         async def read_packet() -> tuple[int, int, str]:
             assert reader is not None
-            raw_len = await asyncio.wait_for(reader.readexactly(4), timeout=8)
+            raw_len = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
             (length,) = struct.unpack("<i", raw_len)
             if length < 10 or length > 4_196_000:
                 raise RconError(f"RCON 响应长度异常：{length}")
-            body = await asyncio.wait_for(reader.readexactly(length), timeout=8)
+            body = await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
             packet_id, packet_type = struct.unpack("<ii", body[:8])
             payload = body[8:-2].decode("utf-8", "replace")
             return packet_id, packet_type, payload
 
         try:
-            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=8)
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
             await send_packet(request_id, 3, password)
             auth_id, _auth_type, _auth_payload = await read_packet()
             if auth_id == -1:
@@ -794,6 +952,342 @@ class AstrbotPluginMcServerManager(Star):
             if lower == denied or lower.startswith(denied + " ") or lower.startswith("minecraft:" + denied):
                 return True, denied
         return False, ""
+
+    def _tool_allows_rcon_command(self, command: str) -> tuple[bool, str]:
+        text = command.strip().lstrip("/")
+        try:
+            parts = shlex.split(text)
+        except ValueError:
+            parts = text.split()
+        first = (parts[0] if parts else "").lower().lstrip("/")
+        first_plain = first.split(":", 1)[-1]
+        allowed = set(self.allowed_rcon_for_tool)
+        if not allowed:
+            return False, "allowed_rcon_for_tool 为空；请显式配置允许 LLM 使用的 RCON 命令。"
+        if first in allowed or first_plain in allowed:
+            return True, ""
+        return False, f"命令 `{first or '空命令'}` 不在 allowed_rcon_for_tool allowlist 中。"
+
+    # ───────────────────────────── RCON Chat Bridge ─────────────────────────
+
+    @staticmethod
+    def parse_rcon_bridge_poll(output: str) -> list[dict[str, Any]]:
+        """Parse `mcai_bridge poll` output produced by the KubeJS bridge script."""
+        rows: list[dict[str, Any]] = []
+        lines = [_strip_ansi(line).strip() for line in str(output or "").splitlines()]
+        try:
+            start = next(i for i, line in enumerate(lines) if line == "MCAI_QUEUE_V1")
+        except StopIteration:
+            return rows
+        for line in lines[start + 1 :]:
+            if not line or line == "empty":
+                continue
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            msg_id = parts[0].strip()
+            try:
+                player = base64.b64decode(parts[1]).decode("utf-8", "replace")
+                message = base64.b64decode(parts[2]).decode("utf-8", "replace")
+                ts = int(float(parts[3]))
+            except Exception:
+                continue
+            if msg_id:
+                rows.append({"id": msg_id, "player": player, "message": message, "timestamp": ts})
+        return rows
+
+    def _match_chat_prefix(self, message: str) -> tuple[bool, str, str]:
+        text = str(message or "").strip()
+        for prefix in sorted(self.chat_prefixes, key=len, reverse=True):
+            if text == prefix:
+                return True, prefix, ""
+            if text.startswith(prefix + " "):
+                return True, prefix, text[len(prefix) :].strip()
+        return False, "", ""
+
+    def _player_allowed_for_chat(self, player: str) -> tuple[bool, str]:
+        name = str(player or "").strip()
+        blocked = {x.lower() for x in _normalize_list(self._cfg("chat_blocked_players"))}
+        allowed = {x.lower() for x in _normalize_list(self._cfg("chat_allowed_players"))}
+        if name.lower() in blocked:
+            return False, "blocked"
+        if allowed and name.lower() not in allowed:
+            return False, "not_allowed"
+        return True, ""
+
+    def _chat_rate_limited(self, player: str) -> tuple[bool, str]:
+        now = time.monotonic()
+        global_cd = _as_int(self._cfg("chat_global_cooldown_seconds"), 1, 0, 3600)
+        player_cd = _as_int(self._cfg("chat_player_cooldown_seconds"), 10, 0, 3600)
+        if global_cd and now - self._chat_global_last < global_cd:
+            return True, f"全局冷却中（{global_cd}s）"
+        last = self._chat_player_last.get(player.lower(), 0.0)
+        if player_cd and now - last < player_cd:
+            return True, f"玩家冷却中（{player_cd}s）"
+        self._chat_global_last = now
+        self._chat_player_last[player.lower()] = now
+        return False, ""
+
+    def _mark_chat_seen(self, event_id: str) -> bool:
+        ttl = _as_int(self._cfg("chat_dedupe_ttl_seconds"), 600, 1, 86400)
+        now = time.monotonic()
+        cutoff = now - ttl
+        for key, value in list(self._chat_seen.items()):
+            if value < cutoff:
+                self._chat_seen.pop(key, None)
+        if event_id in self._chat_seen:
+            return False
+        self._chat_seen[event_id] = now
+        return True
+
+    def _clean_text_for_mc(self, text: str, limit: int) -> str:
+        value = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", str(text or ""))
+        value = re.sub(r"[*_`>#~\[\]]", "", value)
+        value = re.sub(r"\s+", " ", value).strip()
+        return _clip(value, limit)
+
+    def _message_chain_to_text(self, message: MessageChain) -> str:
+        try:
+            text = message.get_plain_text(with_other_comps_mark=True)
+        except Exception:
+            text = str(message)
+        return self._clean_text_for_mc(text, _as_int(self._cfg("chat_reply_max_chars"), 900, 50, 5000))
+
+    async def _rcon_tellraw_all(self, text: str) -> None:
+        if not self.rcon_enabled:
+            raise RconError("RCON 未启用。")
+        chunk_size = _as_int(self._cfg("chat_reply_chunk_chars"), 220, 40, 500)
+        chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)] or [text]
+        for chunk in chunks[:8]:
+            payload = [
+                {"text": "[AI] ", "color": "aqua"},
+                {"text": chunk, "color": "white"},
+            ]
+            command = "tellraw @a " + json.dumps(payload, ensure_ascii=False)
+            try:
+                await self._rcon_exchange(command)
+            except RconError:
+                await self._rcon_exchange("say " + self._clean_text_for_mc("[AI] " + chunk, chunk_size + 16))
+
+    async def _send_discord_chat_sync(self, player: str, question: str, answer: str, event_id: str) -> None:
+        if not _as_bool(self._cfg("chat_discord_sync"), True):
+            return
+        binding = self._load_chat_binding()
+        umo = (binding or {}).get("unified_msg_origin")
+        if not umo:
+            return
+        try:
+            session, _platform, client = self._live_discord_context(umo)
+            channel = client.get_channel(int(session.session_id))
+            if channel is None and hasattr(client, "fetch_channel"):
+                channel = await client.fetch_channel(int(session.session_id))
+            if channel is None:
+                raise RuntimeError(f"Discord channel not found: {session.session_id}")
+            embed = self._native_embed(
+                "Minecraft AI Chat",
+                f"玩家 `{_clip(player, 80)}` 在游戏内触发了 AI。",
+                INFO,
+                [
+                    {"name": "问题", "value": _clip(question, 900), "inline": False},
+                    {"name": "Bot 回复", "value": _clip(answer, 1000), "inline": False},
+                    {"name": "event_id", "value": f"`{_clip(event_id, 120)}`", "inline": False},
+                ],
+            )
+            try:
+                await channel.send(embed=embed)
+            except Exception:
+                fallback = (
+                    f"**Minecraft AI Chat**\n"
+                    f"玩家: `{_clip(player, 80)}`\n"
+                    f"问题: {_clip(question, 900)}\n"
+                    f"回复: {_clip(answer, 1000)}\n"
+                    f"event_id: `{_clip(event_id, 120)}`"
+                )
+                await channel.send(content=_clip(fallback, 1900))
+        except Exception as exc:
+            logger.warning("MC 聊天桥同步 Discord 失败：%s", exc, exc_info=True)
+
+    async def _send_chat_bridge_reply(self, player: str, question: str, answer: str, event_id: str) -> None:
+        answer = self._clean_text_for_mc(answer, _as_int(self._cfg("chat_reply_max_chars"), 900, 50, 5000))
+        try:
+            await self._rcon_tellraw_all(answer)
+        except Exception as exc:
+            logger.warning("MC 聊天桥 RCON 回复失败 event_id=%s: %s", event_id, exc)
+        await self._send_discord_chat_sync(player, question, answer, event_id)
+
+    async def _rcon_bridge_poll(self) -> list[dict[str, Any]]:
+        limit = _as_int(self._cfg("chat_poll_limit"), 20, 1, 100)
+        output = await self._rcon_exchange(f"mcai_bridge poll {limit}")
+        return self.parse_rcon_bridge_poll(output)
+
+    async def _rcon_bridge_ack(self, ids: list[str]) -> None:
+        clean = [re.sub(r"[^0-9A-Za-z_.:-]", "", str(x)) for x in ids if str(x).strip()]
+        clean = [item for item in clean if item]
+        if not clean:
+            return
+        await self._rcon_exchange("mcai_bridge ack " + ",".join(clean[:100]))
+
+    async def _warn_unbound_in_minecraft(self) -> None:
+        try:
+            await self._rcon_tellraw_all("管理员尚未在 Discord 频道执行 /mc bindchat，Minecraft AI 聊天桥暂不可用。")
+        except Exception as exc:
+            logger.warning("MC 聊天桥未绑定提示发送失败：%s", exc)
+
+    def _find_discord_platform(self, platform_id: str) -> Any | None:
+        for platform in self.context.platform_manager.platform_insts:
+            meta_func = getattr(platform, "meta", None)
+            if not callable(meta_func):
+                continue
+            meta = meta_func()
+            if getattr(meta, "id", "") == platform_id and getattr(meta, "name", "") == "discord":
+                return platform
+        return None
+
+    def _live_discord_context(self, umo: str):
+        session = MessageSession.from_str(umo)
+        platform = self._find_discord_platform(session.platform_name)
+        if platform is None:
+            raise RuntimeError(f"cannot find live Discord platform for {umo}")
+        client = platform.client
+        if client is None:
+            raise RuntimeError(f"Discord client unavailable for {umo}")
+        return session, platform, client
+
+    @staticmethod
+    def _is_group_session(session: MessageSession) -> bool:
+        return getattr(session.message_type, "value", "") == "GroupMessage"
+
+    def _build_minecraft_event(self, player: str, question: str, bridge_id: str, umo: str) -> MinecraftSyntheticEvent:
+        session, platform, client = self._live_discord_context(umo)
+        event_id = f"mcai:{bridge_id}"
+        msg = AstrBotMessage()
+        msg.type = session.message_type
+        msg.self_id = str(platform.bot_self_id or "")
+        msg.session_id = session.session_id
+        msg.group_id = session.session_id if self._is_group_session(session) else ""
+        msg.message_id = event_id
+        msg.message = [Plain(question)]
+        msg.message_str = question
+        msg.raw_message = {
+            "synthetic": True,
+            "source": "minecraft_chat",
+            "player": player,
+            "event_id": event_id,
+            "bridge_id": bridge_id,
+            "target_umo": umo,
+        }
+        msg.timestamp = int(time.time())
+        msg.sender = MessageMember(user_id=f"minecraft:{player}", nickname=f"MC:{player}")
+
+        event = MinecraftSyntheticEvent(
+            plugin=self,
+            player=player,
+            question=question,
+            event_id=event_id,
+            message_str=question,
+            message_obj=msg,
+            platform_meta=platform.meta(),
+            session_id=session.session_id,
+            client=client,
+        )
+        event.clear_result()
+        event._force_stopped = False
+        event._has_send_oper = False
+        event.call_llm = False
+        event.is_wake = True
+        event.is_at_or_wake_command = True
+        event.interaction_followup_webhook = None
+        event.set_extra("source", "minecraft_chat")
+        event.set_extra("synthetic", True)
+        event.set_extra("player", player)
+        event.set_extra("event_id", event_id)
+        event.set_extra("bridge_id", bridge_id)
+        return event
+
+    async def _handle_bridge_message(self, item: dict[str, Any]) -> None:
+        bridge_id = str(item.get("id") or "")
+        player = str(item.get("player") or "").strip()
+        raw_message = str(item.get("message") or "")
+        if not bridge_id or not player:
+            return
+        if not self._mark_chat_seen(bridge_id):
+            return
+        matched, _prefix, question = self._match_chat_prefix(raw_message)
+        if not matched:
+            return
+        if not question:
+            await self._rcon_tellraw_all("请在 !ai 后输入要问 AI 的内容。")
+            return
+        allowed, reason = self._player_allowed_for_chat(player)
+        if not allowed:
+            logger.info("MC 聊天桥跳过玩家 %s：%s", player, reason)
+            return
+        limited, limit_reason = self._chat_rate_limited(player)
+        if limited:
+            await self._rcon_tellraw_all(f"{player}，AI 聊天桥{limit_reason}，请稍后再试。")
+            return
+        question = _clip(question, _as_int(self._cfg("chat_message_max_chars"), 500, 20, 5000))
+        binding = self._load_chat_binding()
+        if self.chat_require_discord_binding and not binding:
+            logger.warning("MC 聊天桥收到前缀消息但尚未绑定 Discord 频道：player=%s id=%s", player, bridge_id)
+            await self._warn_unbound_in_minecraft()
+            return
+        umo = (binding or {}).get("unified_msg_origin")
+        if not umo:
+            logger.warning("MC 聊天桥未配置 Discord 绑定，跳过 LLM 注入：player=%s id=%s", player, bridge_id)
+            return
+        event = self._build_minecraft_event(player, question, bridge_id, umo)
+        self.context.get_event_queue().put_nowait(event)
+        logger.info("已注入 MC 聊天桥 synthetic event player=%s id=%s umo=%s", player, bridge_id, umo)
+
+    async def _chat_bridge_loop(self, generation: str) -> None:
+        logger.info("MC RCON 聊天桥任务启动 generation=%s", generation[:8])
+        while generation == self._chat_generation:
+            try:
+                if not self.enable_chat_bridge:
+                    await asyncio.sleep(2)
+                    continue
+                if not self.rcon_enabled:
+                    logger.warning("enable_chat_bridge=true 但 rcon_enabled=false，无法轮询 MC 聊天桥。")
+                    await asyncio.sleep(max(5, _as_int(self._cfg("chat_poll_interval"), 2, 1, 60)))
+                    continue
+                items = await self._rcon_bridge_poll()
+                ack_ids: list[str] = []
+                for item in items:
+                    bridge_id = str(item.get("id") or "")
+                    if bridge_id:
+                        ack_ids.append(bridge_id)
+                    try:
+                        await self._handle_bridge_message(item)
+                    except Exception as exc:
+                        logger.warning("处理 MC 聊天桥消息失败 item=%s: %s", item, exc, exc_info=True)
+                try:
+                    await self._rcon_bridge_ack(ack_ids)
+                except Exception as exc:
+                    logger.warning("MC 聊天桥 ACK 失败 ids=%s: %s", ack_ids[:5], exc)
+                await asyncio.sleep(_as_int(self._cfg("chat_poll_interval"), 2, 1, 60))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("MC RCON 聊天桥轮询失败：%s", exc)
+                await asyncio.sleep(max(5, _as_int(self._cfg("chat_poll_interval"), 2, 1, 60)))
+        logger.info("MC RCON 聊天桥任务退出 generation=%s", generation[:8])
+
+    def _start_chat_bridge_task(self) -> None:
+        registry = getattr(builtins, "_astrbot_mcsm_chat_bridge_tasks", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            setattr(builtins, "_astrbot_mcsm_chat_bridge_tasks", registry)
+        old_task = registry.get(PLUGIN_NAME)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        self._chat_generation = uuid.uuid4().hex
+        task = asyncio.create_task(self._chat_bridge_loop(self._chat_generation))
+        self._chat_bridge_task = task
+        registry[PLUGIN_NAME] = task
+
+    async def initialize(self):
+        self._start_chat_bridge_task()
 
     # ───────────────────────────── Command Payloads ──────────────────────────
 
@@ -929,6 +1423,56 @@ class AstrbotPluginMcServerManager(Star):
         if not sub or sub in {"help", "-h", "--help"}:
             return await self._panel_card_result(event)
 
+        if sub == "bindchat":
+            if not self._is_discord_event(event):
+                return await self._rich_card_result(event, "MC 聊天桥绑定", "`/mc bindchat` 仅支持在 Discord 频道中执行。", WARN)
+            if not self._can_manage(event):
+                return self._deny_result(event)
+            data = self._save_chat_binding(event)
+            return await self._rich_card_result(
+                event,
+                "MC 聊天桥已绑定",
+                "Minecraft 游戏内 `!ai` 消息将注入当前 Discord 频道对应的 AstrBot 会话。",
+                OK,
+                [
+                    {"name": "Discord 频道 UMO", "value": f"`{_clip(data['unified_msg_origin'], 900)}`", "inline": False},
+                    {"name": "绑定人", "value": f"`{_clip(data.get('bound_by', ''), 80)}`", "inline": True},
+                ],
+            )
+
+        if sub == "bindstatus":
+            if not self._can_view(event):
+                return self._deny_result(event)
+            data = self._load_chat_binding()
+            if not data:
+                return await self._rich_card_result(
+                    event,
+                    "MC 聊天桥绑定状态",
+                    "尚未绑定 Discord 频道。管理员可在目标 Discord 频道执行 `/mc bindchat`。",
+                    WARN,
+                )
+            bound_at = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(data.get("bound_at", 0) or 0)))
+            return await self._rich_card_result(
+                event,
+                "MC 聊天桥绑定状态",
+                "已绑定 Discord 频道。",
+                OK,
+                [
+                    {"name": "UMO", "value": f"`{_clip(data.get('unified_msg_origin', ''), 900)}`", "inline": False},
+                    {"name": "绑定人", "value": f"`{_clip(data.get('bound_by', ''), 80)}`", "inline": True},
+                    {"name": "绑定时间", "value": bound_at, "inline": True},
+                    {"name": "桥接启用", "value": str(self.enable_chat_bridge), "inline": True},
+                ],
+            )
+
+        if sub == "unbindchat":
+            if not self._is_discord_event(event):
+                return await self._rich_card_result(event, "MC 聊天桥解绑", "`/mc unbindchat` 仅支持在 Discord 中执行。", WARN)
+            if not self._can_manage(event):
+                return self._deny_result(event)
+            self._delete_chat_binding()
+            return await self._rich_card_result(event, "MC 聊天桥已解绑", "已删除持久化 Discord 频道绑定。", OK)
+
         if sub == "status":
             if not self._can_view(event):
                 return self._deny_result(event)
@@ -996,9 +1540,77 @@ class AstrbotPluginMcServerManager(Star):
         return await self._rich_card_result(
             event,
             "Minecraft 服务端管理",
-            f"未知子命令：`{_clip(sub, 60)}`\n可用：`status/start/stop/restart/logs/cmd/path`",
+            f"未知子命令：`{_clip(sub, 60)}`\n可用：`status/start/stop/restart/logs/cmd/path/bindchat/bindstatus/unbindchat`",
             WARN,
         )
+
+    def _remove_llm_tool(self, request: Any, tool_name: str) -> None:
+        try:
+            func_tool = getattr(request, "func_tool", None)
+            if func_tool:
+                func_tool.remove_tool(tool_name)
+        except Exception as exc:
+            logger.debug("移除 LLM tool %s 失败：%s", tool_name, exc)
+
+    def _is_minecraft_synthetic_event(self, event: AstrMessageEvent) -> bool:
+        try:
+            if event.get_extra("source") == "minecraft_chat":
+                return True
+        except Exception:
+            pass
+        try:
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", {}) or {}
+            return raw.get("source") == "minecraft_chat"
+        except Exception:
+            return False
+
+    @filter.on_llm_request()
+    async def on_llm_request_hook(self, event: AstrMessageEvent, request):
+        """Hide minecraft_rcon_command unless explicitly enabled and authorized."""
+        remove = False
+        if not _as_bool(self._cfg("enable_llm_tool"), False):
+            remove = True
+        elif not self.rcon_enabled:
+            remove = True
+        elif self._is_minecraft_synthetic_event(event) and not _as_bool(self._cfg("llm_tool_allowed_in_mc_chat"), False):
+            remove = True
+        elif not self._can_manage(event):
+            remove = True
+        if remove:
+            self._remove_llm_tool(request, "minecraft_rcon_command")
+
+    @filter.llm_tool(name="minecraft_rcon_command")
+    async def minecraft_rcon_command(self, event: AstrMessageEvent, command: str) -> str:
+        """Execute an allowlisted Minecraft RCON command and return its output.
+
+        Args:
+            command(string): Minecraft command without a leading slash. Only commands
+                configured in allowed_rcon_for_tool are available; dangerous commands
+                in deny_commands are always blocked.
+        """
+        if not _as_bool(self._cfg("enable_llm_tool"), False):
+            return "RCON tool 未启用：enable_llm_tool=false。"
+        if self._is_minecraft_synthetic_event(event) and not _as_bool(self._cfg("llm_tool_allowed_in_mc_chat"), False):
+            return "当前请求来自 Minecraft 游戏内聊天，配置禁止在该场景使用 RCON tool。"
+        if not self._can_manage(event):
+            return "无权限：只有 AstrBot 管理员或 allow_user_ids 用户可调用 Minecraft RCON tool。"
+        if not self.rcon_enabled:
+            return "RCON 未启用：请配置 rcon_enabled/rcon_host/rcon_port/rcon_password。"
+        command = str(command or "").strip().lstrip("/")
+        denied, token = self._is_denied_rcon_command(command)
+        if denied:
+            return f"已拦截：命令 `{token}` 在 deny_commands 中。"
+        allowed, reason = self._tool_allows_rcon_command(command)
+        if not allowed:
+            return reason
+        try:
+            output = await self._rcon_exchange(
+                command,
+                timeout=_as_int(self._cfg("rcon_tool_timeout_seconds"), 8, 1, 60),
+            )
+        except RconError as exc:
+            return f"RCON 执行失败：{exc}"
+        return _clip(output, _as_int(self._cfg("rcon_tool_output_max_chars"), 2000, 200, 10000))
 
     @filter.command("mc")
     async def mc_root_short(self, event: AstrMessageEvent, params: str = "", raw: str = ""):
@@ -1015,4 +1627,16 @@ class AstrbotPluginMcServerManager(Star):
             yield result
 
     async def terminate(self):
-        pass
+        self._chat_generation = uuid.uuid4().hex
+        task = self._chat_bridge_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.debug("MC 聊天桥任务停止异常：%s", exc)
+        registry = getattr(builtins, "_astrbot_mcsm_chat_bridge_tasks", None)
+        if isinstance(registry, dict) and registry.get(PLUGIN_NAME) is task:
+            registry.pop(PLUGIN_NAME, None)

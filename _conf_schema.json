@@ -97,5 +97,113 @@
       "rm"
     ],
     "hint": "匹配首个命令词；默认拦截停服、授权、封禁、踢人和危险文件类命令"
+  },
+  "chat_require_discord_binding": {
+    "description": "MC 游戏内聊天桥是否必须先绑定 Discord 频道",
+    "type": "bool",
+    "default": true,
+    "hint": "默认开启；未绑定时命中 !ai 会通过 RCON 告知游戏内玩家管理员尚未绑定"
+  },
+  "enable_chat_bridge": {
+    "description": "启用 RCON 游戏内聊天桥",
+    "type": "bool",
+    "default": false,
+    "hint": "需要 RCON 可用，并安装 kubejs/server_scripts/mcai_rcon_bridge.js 服务端脚本"
+  },
+  "chat_prefix": {
+    "description": "游戏内触发 AI 的主前缀",
+    "type": "string",
+    "default": "!ai"
+  },
+  "chat_prefixes": {
+    "description": "额外游戏内触发前缀列表",
+    "type": "list",
+    "default": [],
+    "hint": "例如 [\"!bot\", \"ai\"]；chat_prefix 总是自动加入"
+  },
+  "chat_poll_interval": {
+    "description": "RCON 轮询聊天桥队列间隔（秒）",
+    "type": "int",
+    "default": 2
+  },
+  "chat_poll_limit": {
+    "description": "每次 RCON poll 最多消费的聊天队列条数",
+    "type": "int",
+    "default": 20
+  },
+  "chat_allowed_players": {
+    "description": "允许使用聊天桥的 MC 玩家名列表",
+    "type": "list",
+    "default": [],
+    "hint": "为空表示所有未被 blocked 的玩家都允许"
+  },
+  "chat_blocked_players": {
+    "description": "禁止使用聊天桥的 MC 玩家名列表",
+    "type": "list",
+    "default": []
+  },
+  "chat_message_max_chars": {
+    "description": "单条游戏内问题最大字符数",
+    "type": "int",
+    "default": 500
+  },
+  "chat_player_cooldown_seconds": {
+    "description": "单个 MC 玩家触发冷却秒数",
+    "type": "int",
+    "default": 10
+  },
+  "chat_global_cooldown_seconds": {
+    "description": "聊天桥全局触发冷却秒数",
+    "type": "int",
+    "default": 1
+  },
+  "chat_dedupe_ttl_seconds": {
+    "description": "插件侧消息去重 TTL 秒数",
+    "type": "int",
+    "default": 600
+  },
+  "chat_reply_max_chars": {
+    "description": "回写 Minecraft 的 Bot 回复最大字符数",
+    "type": "int",
+    "default": 900
+  },
+  "chat_reply_chunk_chars": {
+    "description": "tellraw/say 分块字符数",
+    "type": "int",
+    "default": 220
+  },
+  "chat_discord_sync": {
+    "description": "将 MC 游戏内 AI 问答同步记录到绑定 Discord 频道",
+    "type": "bool",
+    "default": true
+  },
+  "enable_llm_tool": {
+    "description": "向 LLM 暴露 minecraft_rcon_command 工具",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭；仍会做权限、denylist、allowlist 二次校验"
+  },
+  "llm_tool_allowed_in_mc_chat": {
+    "description": "是否允许 MC 游戏内 synthetic event 使用 RCON tool",
+    "type": "bool",
+    "default": false
+  },
+  "allowed_rcon_for_tool": {
+    "description": "LLM RCON tool 命令 allowlist",
+    "type": "list",
+    "default": [
+      "list"
+    ],
+    "hint": "匹配首个命令词；为空时工具拒绝所有命令"
+  },
+  "rcon_tool_timeout_seconds": {
+    "description": "LLM RCON tool 超时秒数",
+    "type": "int",
+    "default": 8
+  },
+  "rcon_tool_output_max_chars": {
+    "description": "LLM RCON tool 输出最大字符数",
+    "type": "int",
+    "default": 2000
   }
 }
