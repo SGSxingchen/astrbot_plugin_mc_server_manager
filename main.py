@@ -623,7 +623,7 @@ class AstrbotPluginMcServerManager(Star):
                 emoji="🔄",
                 custom_id="mcsm:refresh",
             )
-            async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+            async def refresh_button(self, button: discord.ui.Button, interaction: discord.Interaction):
                 if not await self._require_view(interaction):
                     return
                 await interaction.response.defer()
@@ -635,7 +635,7 @@ class AstrbotPluginMcServerManager(Star):
                 emoji="▶️",
                 custom_id="mcsm:start",
             )
-            async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+            async def start_button(self, button: discord.ui.Button, interaction: discord.Interaction):
                 if not await self._require_manage(interaction):
                     return
                 await interaction.response.defer()
@@ -648,7 +648,7 @@ class AstrbotPluginMcServerManager(Star):
                 emoji="⏹️",
                 custom_id="mcsm:stop",
             )
-            async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+            async def stop_button(self, button: discord.ui.Button, interaction: discord.Interaction):
                 if not await self._require_manage(interaction):
                     return
                 await interaction.response.defer()
@@ -661,7 +661,7 @@ class AstrbotPluginMcServerManager(Star):
                 emoji="🔁",
                 custom_id="mcsm:restart",
             )
-            async def restart_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+            async def restart_button(self, button: discord.ui.Button, interaction: discord.Interaction):
                 if not await self._require_manage(interaction):
                     return
                 await interaction.response.defer()
@@ -674,7 +674,7 @@ class AstrbotPluginMcServerManager(Star):
                 emoji="📜",
                 custom_id="mcsm:logs",
             )
-            async def logs_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+            async def logs_button(self, button: discord.ui.Button, interaction: discord.Interaction):
                 if not await self._require_view(interaction):
                     return
                 await interaction.response.defer()
@@ -686,15 +686,28 @@ class AstrbotPluginMcServerManager(Star):
                 emoji="📁",
                 custom_id="mcsm:path",
             )
-            async def path_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+            async def path_button(self, button: discord.ui.Button, interaction: discord.Interaction):
                 if not await self._require_view(interaction):
                     return
                 await interaction.response.defer()
                 await self._show_paths(interaction)
 
-            async def on_error(self, error: Exception, item, interaction) -> None:
+            async def on_error(self, *args) -> None:
+                # Compatible with discord.py variants:
+                #   on_error(interaction, error, item)
+                #   on_error(error, item, interaction)
+                interaction = None
+                error = None
+                for arg in args:
+                    if hasattr(arg, "response") and hasattr(arg, "followup"):
+                        interaction = arg
+                    elif isinstance(arg, Exception):
+                        error = arg
+                if error is None:
+                    error = RuntimeError("unknown panel callback error")
                 logger.error("MC Server Discord panel callback failed: %s", error, exc_info=True)
-                await self._send_ephemeral(interaction, f"⚠️ 面板操作失败：{type(error).__name__}: {error}")
+                if interaction is not None:
+                    await self._send_ephemeral(interaction, f"⚠️ 面板操作失败：{type(error).__name__}: {error}")
 
         try:
             return McServerPanelView()
