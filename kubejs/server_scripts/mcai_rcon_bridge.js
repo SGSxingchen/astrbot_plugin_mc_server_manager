@@ -47,6 +47,27 @@ PlayerEvents.chat(event => {
 ServerEvents.commandRegistry(event => {
   const { commands: Commands, arguments: Arguments } = event
   event.register(
+    Commands.literal('ai')
+      .then(
+        Commands.argument('message', Arguments.GREEDY_STRING.create(event))
+          .executes(ctx => {
+            const player = ctx.source.playerOrException
+            const message = String(Arguments.GREEDY_STRING.getResult(ctx, 'message') || '').trim()
+            if (message.length > 0) {
+              mcaiQueueMessage(player.username, MCAI_PREFIXES[0] + ' ' + message)
+              try {
+                player.server.tell(Text.of('[AI] <' + player.username + '> ' + message))
+              } catch (e) {
+                player.tell(Text.of('[AI] ' + message))
+              }
+              return 1
+            }
+            return 0
+          })
+      )
+  )
+
+  event.register(
     Commands.literal('mcai_bridge')
       .requires(src => src.hasPermission(4))
       .then(
