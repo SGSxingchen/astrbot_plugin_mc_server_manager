@@ -1,0 +1,10 @@
+name: astrbot_plugin_mc_server_manager
+display_name: Minecraft Server Manager
+description: "管理本地 Minecraft Forge 服务端；Discord Embed 优先，非 Discord 安全降级为文本"
+author: Xia
+version: 1.0.0
+repo: ""
+tags:
+  - minecraft
+  - discord
+  - systemd

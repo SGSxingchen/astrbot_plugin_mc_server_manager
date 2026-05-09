@@ -1,0 +1,101 @@
+{
+  "service_name": {
+    "description": "systemd 服务名",
+    "type": "string",
+    "default": "minecraft-forge-1.20.1.service",
+    "hint": "用于 systemctl start/stop/restart/status"
+  },
+  "server_dir": {
+    "description": "Minecraft 服务端目录",
+    "type": "string",
+    "default": "/root/minecraft/forge-1.20.1-server"
+  },
+  "world_dir": {
+    "description": "Minecraft 世界目录",
+    "type": "string",
+    "default": "/root/minecraft/forge-1.20.1-server/world"
+  },
+  "log_file": {
+    "description": "主日志文件",
+    "type": "string",
+    "default": "/root/minecraft/forge-1.20.1-server/server-systemd.log"
+  },
+  "fallback_log_file": {
+    "description": "备用日志文件",
+    "type": "string",
+    "default": "/root/minecraft/forge-1.20.1-server/server-console.log"
+  },
+  "port": {
+    "description": "Minecraft 服务端端口",
+    "type": "int",
+    "default": 39498
+  },
+  "allow_user_ids": {
+    "description": "额外允许执行管理操作的用户 ID 列表",
+    "type": "list",
+    "default": [],
+    "hint": "start/stop/restart/cmd 除 AstrBot 管理员外，仅允许这里列出的用户"
+  },
+  "public_status": {
+    "description": "公开 status/logs/path",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后 status/logs/path 也仅允许 AstrBot 管理员或 allow_user_ids"
+  },
+  "max_log_lines": {
+    "description": "单次最多显示日志行数",
+    "type": "int",
+    "default": 200
+  },
+  "max_log_chars": {
+    "description": "单次最多显示日志字符数",
+    "type": "int",
+    "default": 6000
+  },
+  "embed_enabled": {
+    "description": "Discord Embed 输出",
+    "type": "bool",
+    "default": true,
+    "hint": "仅 Discord 平台且运行时支持 DiscordEmbed 组件时生效；其他平台自动纯文本"
+  },
+  "rcon_enabled": {
+    "description": "启用 RCON 执行 /mc cmd",
+    "type": "bool",
+    "default": false,
+    "hint": "不会写 systemd stdin；需要在 Minecraft server.properties 中 enable-rcon=true"
+  },
+  "rcon_host": {
+    "description": "RCON 主机",
+    "type": "string",
+    "default": "127.0.0.1"
+  },
+  "rcon_port": {
+    "description": "RCON 端口",
+    "type": "int",
+    "default": 25575
+  },
+  "rcon_password": {
+    "description": "RCON 密码",
+    "type": "string",
+    "default": "",
+    "hint": "请与 server.properties 的 rcon.password 保持一致"
+  },
+  "deny_commands": {
+    "description": "RCON 禁止命令列表",
+    "type": "list",
+    "default": [
+      "stop",
+      "restart",
+      "op",
+      "deop",
+      "whitelist",
+      "pardon",
+      "ban",
+      "ban-ip",
+      "kick",
+      "save-off",
+      "rm"
+    ],
+    "hint": "匹配首个命令词；默认拦截停服、授权、封禁、踢人和危险文件类命令"
+  }
+}
