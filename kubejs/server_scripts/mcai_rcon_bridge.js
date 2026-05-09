@@ -4,9 +4,6 @@
 
 const MCAI_MAX_QUEUE = 200
 const MCAI_MAX_MESSAGE_CHARS = 1000
-// Keep this in sync with the plugin's chat_prefix/chat_prefixes.
-const MCAI_PREFIXES = ['!ai']
-
 global.mcaiBridgeQueue = global.mcaiBridgeQueue || []
 global.mcaiBridgeNextId = global.mcaiBridgeNextId || 1
 
@@ -33,17 +30,6 @@ function mcaiQueueMessage(player, message) {
   while (global.mcaiBridgeQueue.length > MCAI_MAX_QUEUE) global.mcaiBridgeQueue.shift()
 }
 
-function mcaiMatchesPrefix(message) {
-  const text = String(message || '').trim()
-  return MCAI_PREFIXES.some(prefix => text === prefix || text.startsWith(prefix + ' '))
-}
-
-PlayerEvents.chat(event => {
-  if (mcaiMatchesPrefix(event.message)) {
-    mcaiQueueMessage(event.player.username, event.message)
-  }
-})
-
 ServerEvents.commandRegistry(event => {
   const { commands: Commands, arguments: Arguments } = event
   event.register(
@@ -55,7 +41,7 @@ ServerEvents.commandRegistry(event => {
             const player = ctx.source.playerOrException
             const message = String(Arguments.GREEDY_STRING.getResult(ctx, 'message') || '').trim()
             if (message.length > 0) {
-              mcaiQueueMessage(player.username, MCAI_PREFIXES[0] + ' ' + message)
+              mcaiQueueMessage(player.username, message)
               try {
                 player.server.tell(Text.of('[AI] <' + player.username + '> ' + message))
               } catch (e) {

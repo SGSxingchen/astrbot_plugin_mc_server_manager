@@ -76,7 +76,7 @@ mcai_bridge ack 1,2,3
 
 `poll` 输出格式为 `MCAI_QUEUE_V1`，每行包含 `id<TAB>base64(player)<TAB>base64(message)<TAB>timestamp`；插件侧会解析并 ACK。
 
-脚本顶部 `MCAI_PREFIXES` 默认只收集 `!ai` 前缀消息；如果插件配置了额外 `chat_prefixes`，请同步修改该数组。
+脚本注册 `/ai <内容>` 命令并写入队列；不再监听 `!ai` 聊天前缀。
 
 ### 插件侧配置
 
@@ -84,7 +84,7 @@ mcai_bridge ack 1,2,3
 
 - `enable_chat_bridge=true`：启用 RCON 游戏内聊天桥（默认关闭）。
 - `chat_require_discord_binding=true`：默认强制绑定 Discord 频道；未绑定时命中前缀不会进入 LLM，会尝试在 MC 内提示管理员先绑定。
-- `chat_prefix="!ai"`、`chat_prefixes=[]`：游戏内触发前缀。
+- `chat_prefix`/`chat_prefixes`：仅用于兼容旧队列消息；新入口是 KubeJS `/ai <内容>` 命令。
 - `chat_poll_interval=2`、`chat_poll_limit=20`：RCON poll 频率和批量。
 - `chat_allowed_players=[]`、`chat_blocked_players=[]`：玩家 allow/block。
 - `chat_message_max_chars`、`chat_player_cooldown_seconds=0`、`chat_global_cooldown_seconds=0`、`chat_dedupe_ttl_seconds`：裁剪、限流（默认关闭，方便连续对话）、去重。
@@ -96,7 +96,7 @@ mcai_bridge ack 1,2,3
 1. 安装 KubeJS 脚本并启用 RCON。
 2. 在插件配置中设置 `enable_chat_bridge=true`。
 3. 在 Discord 目标频道执行 `/mc bindchat`。
-4. 玩家在游戏内发送 `!ai 你的问题`。
+4. OP 玩家在游戏内执行 `/ai 你的问题`。
 5. 插件通过 RCON poll 到消息后构造 synthetic event 注入 AstrBot；最终回复会双路输出到 Minecraft 和绑定 Discord 频道。
 
 ## LLM RCON Tool

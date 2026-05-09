@@ -1226,10 +1226,12 @@ class AstrbotPluginMcServerManager(Star):
         if not self._mark_chat_seen(bridge_id):
             return
         matched, _prefix, question = self._match_chat_prefix(raw_message)
+        # New KubeJS /ai command queues the plain message directly. Keep prefix
+        # parsing only as backward compatibility for old queued entries.
         if not matched:
-            return
+            question = raw_message.strip()
         if not question:
-            await self._rcon_tellraw_all("请在 !ai 后输入要问 AI 的内容。")
+            await self._rcon_tellraw_all("请在 /ai 后输入要问 AI 的内容。")
             return
         allowed, reason = self._player_allowed_for_chat(player)
         if not allowed:
