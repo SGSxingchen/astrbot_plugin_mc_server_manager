@@ -87,7 +87,7 @@ mcai_bridge ack 1,2,3
 - `chat_prefix="!ai"`、`chat_prefixes=[]`：游戏内触发前缀。
 - `chat_poll_interval=2`、`chat_poll_limit=20`：RCON poll 频率和批量。
 - `chat_allowed_players=[]`、`chat_blocked_players=[]`：玩家 allow/block。
-- `chat_message_max_chars`、`chat_player_cooldown_seconds`、`chat_global_cooldown_seconds`、`chat_dedupe_ttl_seconds`：裁剪、限流、去重。
+- `chat_message_max_chars`、`chat_player_cooldown_seconds=0`、`chat_global_cooldown_seconds=0`、`chat_dedupe_ttl_seconds`：裁剪、限流（默认关闭，方便连续对话）、去重。
 - `chat_reply_max_chars`、`chat_reply_chunk_chars`：回 MC 的 `tellraw @a` 输出裁剪与分块；失败时降级为 `say`。
 - `chat_discord_sync=true`：LLM 回复同步发送到绑定 Discord 频道（Embed，含玩家、问题、回复、event_id）。
 
@@ -107,8 +107,8 @@ mcai_bridge ack 1,2,3
 
 - `enable_llm_tool=false`：默认关闭。
 - `llm_tool_allowed_in_mc_chat=false`：默认禁止 Minecraft synthetic event 使用该 tool。
-- `allowed_rcon_for_tool=["list"]`：LLM tool 命令 allowlist，匹配首个命令词；为空时拒绝所有命令。
+- `allowed_rcon_for_tool=[]`：可选收窄 allowlist；留空表示只按 `deny_commands` 黑名单拦截。
 - `rcon_tool_timeout_seconds=8`
 - `rcon_tool_output_max_chars=2000`
 
-工具可见性会在 `@filter.on_llm_request()` 中动态控制：未启用、无权限、RCON 未启用、或 MC synthetic event 被禁止时移除 tool。工具调用时仍会二次检查权限、RCON、denylist、allowlist、超时与输出裁剪。
+工具可见性会在 `@filter.on_llm_request()` 中动态控制：未启用、无权限、RCON 未启用、或 MC synthetic event 被禁止时移除 tool。工具调用时仍会二次检查权限、RCON、deny_commands 黑名单、可选 allowlist、超时与输出裁剪。

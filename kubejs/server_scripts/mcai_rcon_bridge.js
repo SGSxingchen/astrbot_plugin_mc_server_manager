@@ -48,6 +48,7 @@ ServerEvents.commandRegistry(event => {
   const { commands: Commands, arguments: Arguments } = event
   event.register(
     Commands.literal('ai')
+      .requires(src => src.hasPermission(2))
       .then(
         Commands.argument('message', Arguments.GREEDY_STRING.create(event))
           .executes(ctx => {

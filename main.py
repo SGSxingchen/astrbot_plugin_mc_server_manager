@@ -68,8 +68,8 @@ DEFAULTS: dict[str, Any] = {
     "chat_allowed_players": [],
     "chat_blocked_players": [],
     "chat_message_max_chars": 500,
-    "chat_player_cooldown_seconds": 10,
-    "chat_global_cooldown_seconds": 1,
+    "chat_player_cooldown_seconds": 0,
+    "chat_global_cooldown_seconds": 0,
     "chat_dedupe_ttl_seconds": 600,
     "chat_poll_limit": 20,
     "chat_reply_max_chars": 900,
@@ -77,7 +77,7 @@ DEFAULTS: dict[str, Any] = {
     "chat_discord_sync": True,
     "enable_llm_tool": False,
     "llm_tool_allowed_in_mc_chat": False,
-    "allowed_rcon_for_tool": ["list"],
+    "allowed_rcon_for_tool": [],
     "rcon_tool_timeout_seconds": 8,
     "rcon_tool_output_max_chars": 2000,
 }
@@ -953,6 +953,11 @@ class AstrbotPluginMcServerManager(Star):
         return False, ""
 
     def _tool_allows_rcon_command(self, command: str) -> tuple[bool, str]:
+        """Compatibility hook: RCON tool now uses deny_commands as blacklist.
+
+        `allowed_rcon_for_tool` is kept only for old configs. When non-empty it can
+        still narrow commands, but the default is empty = allow unless denylisted.
+        """
         text = command.strip().lstrip("/")
         try:
             parts = shlex.split(text)
@@ -962,7 +967,7 @@ class AstrbotPluginMcServerManager(Star):
         first_plain = first.split(":", 1)[-1]
         allowed = set(self.allowed_rcon_for_tool)
         if not allowed:
-            return False, "allowed_rcon_for_tool 为空；请显式配置允许 LLM 使用的 RCON 命令。"
+            return True, ""
         if first in allowed or first_plain in allowed:
             return True, ""
         return False, f"命令 `{first or '空命令'}` 不在 allowed_rcon_for_tool allowlist 中。"
@@ -1593,12 +1598,11 @@ class AstrbotPluginMcServerManager(Star):
 
     @filter.llm_tool(name="minecraft_rcon_command")
     async def minecraft_rcon_command(self, event: AstrMessageEvent, command: str) -> str:
-        """Execute an allowlisted Minecraft RCON command and return its output.
+        """Execute a Minecraft RCON command and return its output.
 
         Args:
-            command(string): Minecraft command without a leading slash. Only commands
-                configured in allowed_rcon_for_tool are available; dangerous commands
-                in deny_commands are always blocked.
+            command(string): Minecraft command without a leading slash. Commands in
+                deny_commands are blocked; allowed_rcon_for_tool is optional legacy narrowing.
         """
         if not _as_bool(self._cfg("enable_llm_tool"), False):
             return "RCON tool 未启用：enable_llm_tool=false。"

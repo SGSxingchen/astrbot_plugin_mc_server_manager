@@ -150,12 +150,12 @@
   "chat_player_cooldown_seconds": {
     "description": "单个 MC 玩家触发冷却秒数",
     "type": "int",
-    "default": 10
+    "default": 0
   },
   "chat_global_cooldown_seconds": {
     "description": "聊天桥全局触发冷却秒数",
     "type": "int",
-    "default": 1
+    "default": 0
   },
   "chat_dedupe_ttl_seconds": {
     "description": "插件侧消息去重 TTL 秒数",
@@ -191,9 +191,7 @@
   "allowed_rcon_for_tool": {
     "description": "LLM RCON tool 命令 allowlist",
     "type": "list",
-    "default": [
-      "list"
-    ],
+    "default": [],
     "hint": "匹配首个命令词；为空时工具拒绝所有命令"
   },
   "rcon_tool_timeout_seconds": {
