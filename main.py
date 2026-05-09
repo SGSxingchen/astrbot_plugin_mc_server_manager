@@ -1580,8 +1580,12 @@ class AstrbotPluginMcServerManager(Star):
             remove = True
         elif not self.rcon_enabled:
             remove = True
-        elif self._is_minecraft_synthetic_event(event) and not _as_bool(self._cfg("llm_tool_allowed_in_mc_chat"), False):
-            remove = True
+        elif self._is_minecraft_synthetic_event(event):
+            # Minecraft synthetic events use sender ids like `minecraft:Steve`,
+            # so they will not pass AstrBot admin/allow_user_ids checks. Gate
+            # them only by the explicit llm_tool_allowed_in_mc_chat switch.
+            if not _as_bool(self._cfg("llm_tool_allowed_in_mc_chat"), False):
+                remove = True
         elif not self._can_manage(event):
             remove = True
         if remove:
@@ -1598,9 +1602,10 @@ class AstrbotPluginMcServerManager(Star):
         """
         if not _as_bool(self._cfg("enable_llm_tool"), False):
             return "RCON tool 未启用：enable_llm_tool=false。"
-        if self._is_minecraft_synthetic_event(event) and not _as_bool(self._cfg("llm_tool_allowed_in_mc_chat"), False):
+        is_mc_chat = self._is_minecraft_synthetic_event(event)
+        if is_mc_chat and not _as_bool(self._cfg("llm_tool_allowed_in_mc_chat"), False):
             return "当前请求来自 Minecraft 游戏内聊天，配置禁止在该场景使用 RCON tool。"
-        if not self._can_manage(event):
+        if not is_mc_chat and not self._can_manage(event):
             return "无权限：只有 AstrBot 管理员或 allow_user_ids 用户可调用 Minecraft RCON tool。"
         if not self.rcon_enabled:
             return "RCON 未启用：请配置 rcon_enabled/rcon_host/rcon_port/rcon_password。"
