@@ -1,36 +1,28 @@
 // KubeJS 6 / Minecraft Forge 1.20.1
 // Minimal RCON-pollable chat queue for AstrBot Minecraft Server Manager.
-// Install: copy this file to <server>/kubejs/server_scripts/mcai_rcon_bridge.js,
-// then restart the server or run `/reload` after KubeJS is loaded.
-
-const Component = Java.loadClass('net.minecraft.network.chat.Component')
-const Base64 = Java.loadClass('java.util.Base64')
-const StandardCharsets = Java.loadClass('java.nio.charset.StandardCharsets')
-const JavaString = Java.loadClass('java.lang.String')
-const IntegerArgumentType = Java.loadClass('com.mojang.brigadier.arguments.IntegerArgumentType')
-const StringArgumentType = Java.loadClass('com.mojang.brigadier.arguments.StringArgumentType')
+// No Java.loadClass here: keep it compatible with strict Rhino class filters.
 
 const MCAI_MAX_QUEUE = 200
 const MCAI_MAX_MESSAGE_CHARS = 1000
-// Keep this in sync with the plugin's chat_prefix/chat_prefixes. Only matching
-// player messages enter the RCON-pollable queue.
+// Keep this in sync with the plugin's chat_prefix/chat_prefixes.
 const MCAI_PREFIXES = ['!ai']
 
 global.mcaiBridgeQueue = global.mcaiBridgeQueue || []
 global.mcaiBridgeNextId = global.mcaiBridgeNextId || 1
 
-function mcaiB64(value) {
-  return Base64.getEncoder().encodeToString(new JavaString(String(value || '')).getBytes(StandardCharsets.UTF_8))
+function mcaiEnc(value) {
+  return encodeURIComponent(String(value || ''))
 }
 
 function mcaiReply(source, text) {
-  const component = Component.literal(String(text || ''))
+  const msg = String(text || '')
   try {
-    source.sendSuccess(() => component, false)
+    source.sendSystemMessage(Text.of(msg))
   } catch (e) {
-    source.sendSystemMessage(component)
+    console.log(msg)
   }
 }
+
 
 function mcaiQueueMessage(player, message) {
   const cleanPlayer = String(player || '').substring(0, 80)
@@ -46,8 +38,6 @@ function mcaiMatchesPrefix(message) {
   return MCAI_PREFIXES.some(prefix => text === prefix || text.startsWith(prefix + ' '))
 }
 
-// Capture prefixed player chat into an in-memory queue. The AstrBot plugin
-// validates the prefix again on the RCON side as a safety check.
 PlayerEvents.chat(event => {
   if (mcaiMatchesPrefix(event.message)) {
     mcaiQueueMessage(event.player.username, event.message)
@@ -55,23 +45,25 @@ PlayerEvents.chat(event => {
 })
 
 ServerEvents.commandRegistry(event => {
-  const Commands = event.commands
+  const { commands: Commands, arguments: Arguments } = event
   event.register(
     Commands.literal('mcai_bridge')
-      .requires(source => source.hasPermission(4))
+      .requires(src => src.hasPermission(4))
       .then(
         Commands.literal('poll')
           .then(
-            Commands.argument('limit', IntegerArgumentType.integer(1, 100))
+            Commands.argument('limit', Arguments.INTEGER.create(event))
               .executes(ctx => {
-                const limit = IntegerArgumentType.getInteger(ctx, 'limit')
-                const lines = ['MCAI_QUEUE_V1']
+                let limit = Arguments.INTEGER.getResult(ctx, 'limit')
+                if (limit < 1) limit = 1
+                if (limit > 100) limit = 100
+                const lines = ['MCAI_QUEUE_V2']
                 const items = global.mcaiBridgeQueue.slice(0, limit)
                 if (items.length === 0) {
                   lines.push('empty')
                 } else {
                   items.forEach(item => {
-                    lines.push([item.id, mcaiB64(item.player), mcaiB64(item.message), String(item.ts || 0)].join('\t'))
+                    lines.push([item.id, mcaiEnc(item.player), mcaiEnc(item.message), String(item.ts || 0)].join('\t'))
                   })
                 }
                 mcaiReply(ctx.source, lines.join('\n'))
@@ -79,13 +71,13 @@ ServerEvents.commandRegistry(event => {
               })
           )
           .executes(ctx => {
-            const lines = ['MCAI_QUEUE_V1']
+            const lines = ['MCAI_QUEUE_V2']
             const items = global.mcaiBridgeQueue.slice(0, 20)
             if (items.length === 0) {
               lines.push('empty')
             } else {
               items.forEach(item => {
-                lines.push([item.id, mcaiB64(item.player), mcaiB64(item.message), String(item.ts || 0)].join('\t'))
+                lines.push([item.id, mcaiEnc(item.player), mcaiEnc(item.message), String(item.ts || 0)].join('\t'))
               })
             }
             mcaiReply(ctx.source, lines.join('\n'))
@@ -95,9 +87,9 @@ ServerEvents.commandRegistry(event => {
       .then(
         Commands.literal('ack')
           .then(
-            Commands.argument('ids', StringArgumentType.word())
+            Commands.argument('ids', Arguments.STRING.create(event))
               .executes(ctx => {
-                const raw = StringArgumentType.getString(ctx, 'ids')
+                const raw = String(Arguments.STRING.getResult(ctx, 'ids') || '')
                 const ids = new Set(raw.split(',').map(x => x.trim()).filter(x => x.length > 0))
                 const before = global.mcaiBridgeQueue.length
                 global.mcaiBridgeQueue = global.mcaiBridgeQueue.filter(item => !ids.has(String(item.id)))

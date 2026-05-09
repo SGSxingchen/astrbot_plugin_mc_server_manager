@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import builtins
 import json
 import re
@@ -976,9 +975,10 @@ class AstrbotPluginMcServerManager(Star):
         rows: list[dict[str, Any]] = []
         lines = [_strip_ansi(line).strip() for line in str(output or "").splitlines()]
         try:
-            start = next(i for i, line in enumerate(lines) if line == "MCAI_QUEUE_V1")
+            start = next(i for i, line in enumerate(lines) if line in {"MCAI_QUEUE_V1", "MCAI_QUEUE_V2"})
         except StopIteration:
             return rows
+        version = lines[start]
         for line in lines[start + 1 :]:
             if not line or line == "empty":
                 continue
@@ -987,8 +987,16 @@ class AstrbotPluginMcServerManager(Star):
                 continue
             msg_id = parts[0].strip()
             try:
-                player = base64.b64decode(parts[1]).decode("utf-8", "replace")
-                message = base64.b64decode(parts[2]).decode("utf-8", "replace")
+                if version == "MCAI_QUEUE_V1":
+                    import base64
+
+                    player = base64.b64decode(parts[1]).decode("utf-8", "replace")
+                    message = base64.b64decode(parts[2]).decode("utf-8", "replace")
+                else:
+                    from urllib.parse import unquote
+
+                    player = unquote(parts[1])
+                    message = unquote(parts[2])
                 ts = int(float(parts[3]))
             except Exception:
                 continue
